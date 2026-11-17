@@ -1,0 +1,4 @@
+# Behringer firmware is copyrighted: never commit original or patched images
+*.syx
+.DS_Store
+__pycache__/
