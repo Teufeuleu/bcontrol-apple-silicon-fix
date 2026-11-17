@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Patch Behringer BCR2000 firmware 1.10 so the device works over USB on Apple silicon Macs.
+Patch Behringer BCR2000 / BCF2000 firmware 1.10 so the device works over USB on Apple silicon Macs.
 
-The BCR2000 advertises wMaxPacketSize=4 on its bulk OUT endpoint 0x02, which is illegal
+The BCR2000 and BCF2000 advertise wMaxPacketSize=4 on its bulk OUT endpoint 0x02, which is illegal
 for full-speed bulk endpoints (USB 2.0 section 5.8.3: 8, 16, 32 or 64). The USB controller in
 Apple silicon Macs refuses to create that endpoint, so nothing sent from the Mac reaches the
 device. This script changes the advertised value to 8 in all four USB-mode descriptor sets
@@ -10,7 +10,8 @@ device. This script changes the advertised value to 8 in all four USB-mode descr
 already handles several MIDI events per packet, so only the advertised value changes.
 
 Usage:
-    python3 patch_bcr2000_usb.py bcr2000_1-10.syx [bcr2000_1-10-usbfix.syx]
+    python3 patch_bc2000_usb.py bcr2000_1-10.syx [bcr2000_1-10-usbfix.syx]
+    python3 patch_bc2000_usb.py bcf2000_1-10.syx [bcf2000_1-10-usbfix.syx]
 
 Firmware container format (sysex framing, ciphers, checksums) ported to Python 3 from
 bcfwconvert.py, Copyright (C) 2010 Willem van Engen, as published in
@@ -22,11 +23,27 @@ import sys
 
 # --- known inputs/outputs ---------------------------------------------------------------
 
-FIRMWARE_1_10_SHA256 = "9ebef1c75aa07d00613a20fb8cd9d58dbcfa9f076f1d8657904e3a6a669bae1d"
-PATCHED_SHA256 = "3402425ca2f8d6d0934c50aa30a66e7d1ae909b66abd09d2f502a91b64437f8c"
-BCR2000_HEADER = bytes.fromhex("f0 00 20 32 7f 15 34")   # Behringer, any device, BCR2000, firmware
 EP_OUT_DESCRIPTOR = bytes.fromhex("09 05 02 02 04 00 00")  # bulk OUT 0x02, wMaxPacketSize=4
-DESCRIPTOR_OFFSETS = [0xDD25, 0xDD75, 0xDDD6, 0xDE46]      # in the decoded OS image
+
+
+class Firmware:
+    def __init__(self, name, sha256, model, offsets, patched_sha256, tested):
+        self.name, self.sha256, self.offsets = name, sha256, offsets
+        self.header = bytes([0xF0, 0x00, 0x20, 0x32, 0x7F, model, 0x34])  # Behringer firmware packet
+        self.patched_sha256, self.tested = patched_sha256, tested
+
+
+# Offsets are positions of EP_OUT_DESCRIPTOR in the decoded OS image (U-1..U-4 descriptor sets).
+KNOWN_FIRMWARE = [
+    Firmware("BCR2000 1.10",
+             "9ebef1c75aa07d00613a20fb8cd9d58dbcfa9f076f1d8657904e3a6a669bae1d", 0x15,
+             [0xDD25, 0xDD75, 0xDDD6, 0xDE46],
+             "3402425ca2f8d6d0934c50aa30a66e7d1ae909b66abd09d2f502a91b64437f8c", tested=True),
+    Firmware("BCF2000 1.10",
+             "9c9a79cf54e0bcee6827db2c77f491663b4fdb9cd25006207c476418c67a98d3", 0x14,
+             [0xE601, 0xE651, 0xE6B2, 0xE722],
+             "fba0c7c8550bcd30e3f243175512a03587462f109a1e08a50658f8c79594389c", tested=False),
+]
 NEW_MAX_PACKET_SIZE = 0x08
 
 # --- sysex layer --------------------------------------------------------------------------
@@ -186,29 +203,36 @@ def die(msg):
 
 def main(argv):
     if len(argv) not in (2, 3):
-        sys.exit(__doc__.split("Usage:")[1].split("Firmware container")[0].strip())
+        usage = __doc__.split("Usage:")[1].split("Firmware container")[0]
+        sys.exit("usage:\n" + "\n".join(l.rstrip() for l in usage.strip("\n").splitlines()))
     src = argv[1]
     dst = argv[2] if len(argv) == 3 else src.rsplit(".", 1)[0] + "-usbfix.syx"
 
-    raw = open(src, "rb").read()
+    try:
+        raw = open(src, "rb").read()
+    except OSError as e:
+        die("cannot read %s: %s" % (src, e.strerror))
     digest = hashlib.sha256(raw).hexdigest()
-    if digest == PATCHED_SHA256:
-        die("%s is already patched" % src)
-    if digest != FIRMWARE_1_10_SHA256:
-        die("%s is not the official BCR2000 firmware 1.10 file (sha256 %s)" % (src, digest))
+    for fw in KNOWN_FIRMWARE:
+        if digest == fw.patched_sha256:
+            die("%s is an already patched %s firmware" % (src, fw.name))
+    fw = next((f for f in KNOWN_FIRMWARE if f.sha256 == digest), None)
+    if fw is None:
+        die("%s is not an official BCR2000 or BCF2000 firmware 1.10 file (sha256 %s)" % (src, digest))
+    print("Input: official %s firmware" % fw.name)
 
     header, base, flash = syx_to_flash(raw)
-    if header != BCR2000_HEADER or base != 0x2000:
+    if header != fw.header or base != 0x2000:
         die("unexpected firmware layout")
     image = flash_to_os(flash)
     found = [i for i in range(len(image)) if image.startswith(EP_OUT_DESCRIPTOR, i)]
-    if found != DESCRIPTOR_OFFSETS:
+    if found != fw.offsets:
         die("USB descriptors not where expected")
     if flash_to_syx(os_to_flash(image, len(flash)), base, header) != raw:
         die("re-encoding check failed")
 
     patched = bytearray(image)
-    for off in DESCRIPTOR_OFFSETS:
+    for off in fw.offsets:
         patched[off + 4] = NEW_MAX_PACKET_SIZE
     out = flash_to_syx(os_to_flash(bytes(patched), len(flash)), base, header)
 
@@ -216,17 +240,19 @@ def main(argv):
     _, _, check_flash = syx_to_flash(out)
     check = flash_to_os(check_flash)
     changed = [i for i in range(len(image)) if image[i] != check[i]]
-    if len(check) != len(image) or changed != [o + 4 for o in DESCRIPTOR_OFFSETS]:
+    if len(check) != len(image) or changed != [o + 4 for o in fw.offsets]:
         die("verification of patched file failed")
-    if hashlib.sha256(out).hexdigest() != PATCHED_SHA256:
+    out_digest = hashlib.sha256(out).hexdigest()
+    if out_digest != fw.patched_sha256:
         die("patched output does not match the expected checksum")
 
     with open(dst, "wb") as f:
         f.write(out)
     print("Patched %d USB descriptors (bulk OUT wMaxPacketSize 4 -> 8)." % len(changed))
     print("Wrote %s" % dst)
-    print("sha256 %s" % PATCHED_SHA256)
-
+    print("sha256 %s" % out_digest)
+    if not fw.tested:
+        print("WARNING: this patch has not been tested on a real %s yet. See README." % fw.name.split()[0])
 
 if __name__ == "__main__":
     main(sys.argv)
